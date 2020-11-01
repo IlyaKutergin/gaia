@@ -1,5 +1,7 @@
 'use strict';
-/* global ItemStore, LazyLoader, Configurator, groupEditor */
+/* global ItemStore, LazyLoader, Configurator,
+          groupEditor, PinnedAppsNavigation, Clock,
+          PinnedAppsManager, MoreAppsNavigation, Toaster */
 /* global requestAnimationFrame */
 
 (function(exports) {
@@ -29,14 +31,13 @@
     window.addEventListener('gaiagrid-saveitems', this);
     window.addEventListener('online', this.retryFailedIcons.bind(this));
 
-    var editModeDone = document.getElementById('exit-edit-mode');
-    editModeDone.addEventListener('click', this.exitEditMode);
-
     window.addEventListener('gaiagrid-dragdrop-begin', this);
     window.addEventListener('gaiagrid-dragdrop-finish', this);
 
     window.addEventListener('context-menu-open', this);
     window.addEventListener('context-menu-close', this);
+
+    window.addEventListener('keydown', this);
 
     this.layoutReady = false;
     window.addEventListener('gaiagrid-layout-ready', this);
@@ -47,12 +48,36 @@
 
     window.performance.mark('navigationInteractive');
     window.dispatchEvent(new CustomEvent('moz-chrome-interactive'));
+
   }
 
   App.prototype = {
 
     HIDDEN_ROLES: HIDDEN_ROLES,
     EDIT_MODE_TRANSITION_STYLE: EDIT_MODE_TRANSITION_STYLE,
+
+    /**
+     * This is a variable that used for storing MoreApps visibility
+     * @type {Boolean}
+     */
+    inMoreApps: false,
+
+    /**
+     * This is a variable stores deleted items from Pinned Apps before
+     * saving changes
+     * @type {Array}
+     */
+    deletedApps: [],
+
+    pinnedAppsManager: null,
+    pinnedAppsNavigation: null,
+
+    /**
+     * This is a variable stores main screen's link for performance optimization
+     * @type {Array}
+     */
+    mainScreen: document.getElementById('main-screen'),
+    clock: new Clock(),
 
     /**
      * Showing the correct icon is ideal but sometimes not possible if the
@@ -82,6 +107,22 @@
       }
     },
 
+    isInPinnedApps : function(result) {
+      var pinnedItems = app.pinnedAppsManager.items;
+      var resManifest = result.app.manifestURL;
+      var resEntryPoint = result.app.entryPoint;
+
+      for (var i=0; i<pinnedItems.length; i++){
+        if(pinnedItems[i].entry!=null &&
+            resManifest == pinnedItems[i].entry.manifestURL &&
+            (typeof (resEntryPoint) !== 'undefined' &&
+              pinnedItems[i].entry.entry_point == resEntryPoint)){
+          return true;
+        }
+      }
+      return false;
+    },
+
     /**
      * Fetch all icons and render them.
      */
@@ -98,9 +139,15 @@
         });
       });
 
+      //TODO: Make a dynamic load of gaia_grid_rs component.
+      //Load it when gaia grid launch at the first time
+      //not when all application starts
       this.itemStore.all(function _all(results) {
         results.forEach(function _eachResult(result) {
-          this.grid.add(result);
+
+          if(!this.isInPinnedApps (result)){
+            this.grid.add(result);
+          }
         }, this);
 
         if (this.layoutReady) {
@@ -125,11 +172,212 @@
             window.performance.mark('fullyLoaded');
             window.dispatchEvent(new CustomEvent('moz-app-loaded'));
           });
+        MoreAppsNavigation.init();
       }.bind(this));
+
+      this.pinnedAppsManager = new PinnedAppsManager();
+
+      /**
+       * After data about applications was loaded to screen it should be
+       * initialized main screen's timer for clock, manager for main screen
+       * and navigation for main screen.
+       */
+      window.addEventListener('pinned-apps-loaded', function(e) {
+        this.pinnedAppsManager.init();
+        this.clock.start();
+        var pinnedApps = document.getElementById('pinned-apps-list');
+        var sel = '#pinned-apps-list .pinned-app-item';
+        try{
+          this.pinnedAppsNavigation = new PinnedAppsNavigation(pinnedApps, sel);
+        } catch(exception) {
+          console.error(exception);
+        }
+      }.bind(this));
+
+    },
+
+    /**
+     * Save all items(added, deleted, rearranged) from homescrenn
+     * deletedApps - store all unpinned items
+     * deleted items temporary marked by css class "hidden-item"
+     * no params
+     */
+
+    saveAllPinnedApps: function(){
+
+      var pinnedItems= app.pinnedAppsManager.items;
+      if(this.deletedApps.length>0){
+        for(var z = 0; z < this.deletedApps.length; z++){
+          app.itemStore.deletePinnedAppItem(this.deletedApps[z]);
+        }
+        this.deletedApps.splice(0,this.deletedApps.length);
+      }
+
+      for(var i = 0; i<pinnedItems.length; i++){
+
+        if(pinnedItems[i].element.classList.contains('hidden-item')){
+          pinnedItems.splice(i,1);
+        }
+
+        var obj = {};
+
+        if(pinnedItems[i].entry && pinnedItems[i].entry!=null){
+
+          var curEntry = pinnedItems[i].entry;
+          obj.name = curEntry.name;
+
+          obj.manifestURL = curEntry.manifestURL ||
+            curEntry.targetApp.manifestURL;
+
+          obj.icon = curEntry.icon || curEntry.icon.baseURI;
+
+          obj.index = pinnedItems[i].index;
+
+          app.itemStore.savePinnedAppItem(obj);
+
+        }
+      }
+
+      Toaster.showToast({
+        messageL10nId: 'changes-saved',
+        latency: 3000
+      });
+
+    },
+
+    pinToMainScreen: function(){
+      var pinnedApps = app.pinnedAppsNavigation;
+      pinnedApps.reset();
+
+      var moreAppsSelected = '#more-apps-screen .selected';
+      var selMoreApp = document.querySelector(moreAppsSelected);
+      var selMoreAppIcon = selMoreApp.getAttribute('data-test-icon');
+      var selMoreAppDataId = selMoreApp.getAttribute('data-identifier');
+      var selMoreAppTitle = selMoreApp.querySelector('span.title').textContent;
+      var maxDataIndex = app.pinnedAppsManager.items.length;
+
+      app.pinnedAppsManager.addEntry( maxDataIndex,
+                                      selMoreAppDataId,
+                                      selMoreAppIcon,
+                                      selMoreAppTitle);
+
+      Array.prototype.slice.call(
+        document.querySelector('#more-apps-screen #icons').children
+      );
+
+      app.itemStore.applicationSource.
+        removeIconFromGrid( selMoreAppDataId );
+
+      this.renderGrid();
+
+      if (selMoreApp.parentNode) {
+        selMoreApp.parentNode.removeChild(selMoreApp);
+      }
+
+      this.hideMoreApps();
+
+      Toaster.showToast({
+        messageL10nId: 'added-to-home-screen',
+        latency: 3000
+      });
+
+      pinnedApps.refresh();
+
+      for(var i=0; i<=maxDataIndex; i++){
+        pinnedApps.arrowDownFunc();
+      }
+
+    },
+
+    unpinFromMainScreen: function(){
+
+      var selPinnedApp = document.querySelector('#pinned-apps-list .selected');
+      var selPinnedAppDataId = selPinnedApp.dataset.index;
+
+      app.pinnedAppsNavigation.refresh();
+
+      this.deletedApps.push(
+        app.pinnedAppsManager.items[selPinnedAppDataId]
+        );
+
+      app.pinnedAppsManager.items[selPinnedAppDataId].
+        element.classList.add('hidden-item');
+
+      if (selPinnedApp.parentNode) {
+        selPinnedApp.parentNode.removeChild(selPinnedApp);
+      }
+
+      app.pinnedAppsNavigation.elements[1].classList.add('selected');
+      app.pinnedAppsNavigation.elemList.classList.add('animation');
+      app.pinnedAppsNavigation.refresh();
+
+      Toaster.showToast({
+        messageL10nId: 'removed-from-home-screen',
+        latency: 3000
+      });
+
+      app.pinnedAppsNavigation.refresh();
+      app.pinnedAppsNavigation.reset();
+    },
+
+    startPersonalize: function(){
+      this.mainScreen.classList.add('personalize_mode');
+      var ScreenHeader = document.getElementById('main-screen-header');
+      ScreenHeader.classList.remove('hidden-item');
+
+      if( !document.getElementById('addFromMoreApps')){
+        app.pinnedAppsNavigation.reset();
+
+        var plusButton = document.createElement('div');
+        plusButton.classList.add('pinned-app-item');
+        plusButton.setAttribute('id', 'addFromMoreApps');
+        plusButton.setAttribute('data-index', '998');
+
+          var plusButtonSpan = document.createElement('span');
+          plusButtonSpan.classList.add('title');
+          plusButtonSpan.style.visibility = 'visible';
+
+        plusButton.appendChild(plusButtonSpan);
+
+        var pinList = document.getElementById('pinned-apps-list');
+        var moreAppsLi = document.getElementById('moreApps');
+        pinList.insertBefore(plusButton, moreAppsLi);
+
+        app.pinnedAppsNavigation.refresh();
+      }
+    },
+
+    endPersonalize: function(){
+      var ScreenHeader = document.getElementById('main-screen-header');
+      ScreenHeader.classList.add('hidden-item');
+      var plusButton = document.getElementById('addFromMoreApps');
+      this.mainScreen.classList.remove('personalize_mode');
+      if (plusButton.parentNode) {
+        plusButton.parentNode.removeChild(plusButton);
+      }
+
+    },
+
+    rearrange: function(){
+      this.mainScreen.classList.add('rearrange_mode');
+    },
+
+    exitRearrange: function(){
+      this.mainScreen.classList.remove('rearrange_mode');
+    },
+
+    enterMoreAppsPersonalise: function(){
+      document.getElementById('more-apps-screen').classList
+        .add('personalize_mode');
+      this.showMoreApps();
+    },
+
+    exitMoreAppsPersonalise: function(){
+      document.getElementById('more-apps-screen').classList
+        .remove('personalize_mode');
     },
 
     renderGrid: function() {
-      this.grid.setEditHeaderElement(document.getElementById('edit-header'));
       this.grid.render();
     },
 
@@ -139,6 +387,37 @@
 
     stop: function() {
       this.grid.stop();
+    },
+
+    getAppByURL: function(url) {
+      return this.itemStore.getAppByURL(url);
+    },
+
+    getPinnedAppsList: function() {
+      return this.itemStore.getPinnedAppsList();
+    },
+
+    savePinnedAppItem: function(obj) {
+      this.itemStore.savePinnedAppItem(obj);
+    },
+
+    savePinnedApps: function(objs) {
+      this.itemStore.savePinnedApps(objs);
+    },
+
+    showMoreApps: function() {
+      this.inMoreApps = true;
+      console.log('inMoreApps is : ' + this.inMoreApps);
+      this.mainScreen.classList.add('hidden');
+      document.getElementById('more-apps-screen').classList.remove('hidden');
+      MoreAppsNavigation.reset();
+    },
+
+    hideMoreApps: function() {
+      this.inMoreApps = false;
+      console.log('inMoreApps is : ' + this.inMoreApps);
+      this.mainScreen.classList.remove('hidden');
+      document.getElementById('more-apps-screen').classList.add('hidden');
     },
 
     /**
@@ -155,15 +434,7 @@
         item.updateTitle();
       });
       this.renderGrid();
-    },
-
-    /**
-     * Called when we press 'Done' to exit edit mode.
-     * Fires a custom event to use the same path as pressing the home button.
-     */
-    exitEditMode: function(e) {
-      e.preventDefault();
-      window.dispatchEvent(new CustomEvent('hashchange'));
+      app.pinnedAppsManager.items.forEach(item => item.render());
     },
 
     /**
@@ -190,10 +461,6 @@
 
         case 'edititem':
           var icon = e.detail;
-          if (icon.detail.type != 'divider') {
-            // We only edit groups
-            return;
-          }
 
           LazyLoader.load('js/edit_group.js', () => {
             groupEditor.edit(icon);
@@ -312,8 +579,8 @@
           // Only inline-style can get higher specificity than a scoped style,
           // so the property is written as inline way.
           //
-          // 'transform 0.25s' is from the original property in gaia-grid.
-          // ( shared/elements/gaia_grid/style.css )
+          // 'transform 0.25s' is from the original property in gaia-grid-rs.
+          // ( shared/elements/gaia_grid_rs/style.css )
           //
           // 'height 0s 0.5s' is to apply collapsing animation in edit mode.
           this.grid.style.transition = this.EDIT_MODE_TRANSITION_STYLE;
@@ -324,10 +591,23 @@
           this.grid.style.transition = '';
           break;
 
+        case 'keydown':
+          if (this.inMoreApps){
+            MoreAppsNavigation.handleEvent(e);
+          }else{
+            this.pinnedAppsNavigation.handleEvent(e);
+          }
+          break;
+
         // A hashchange event means that the home button was pressed.
         // The system app changes the hash of the homescreen iframe when it
         // receives a home button press.
         case 'hashchange':
+          this.hideMoreApps();
+          this.pinnedAppsNavigation.reset();
+          this.clock.show();
+          this.clock.start();
+
           // The group editor UI will be hidden by itself so returning...
           var editor = exports.groupEditor;
           if (editor && !editor.hidden) {
@@ -356,6 +636,9 @@
 
   // Dummy configurator
   exports.configurator = {
+    getPinnedApps: function() {
+      return [];
+    },
     getSingleVariantApp: function() {
       return {};
     },
